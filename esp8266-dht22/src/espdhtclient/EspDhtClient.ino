@@ -1,32 +1,36 @@
 /*
- See:
-  1) https://www.arduino.cc/en/Tutorial/ScanNetworks
-  2) https://www.arduino.cc/en/Tutorial/WiFiWebClientRepeating
-  3) https://github.com/gonium/esp8266-dht22-sensor for the inspiration for reading the DHT22 sensor values
- */
+  See:
+  1) https://github.com/gonium/esp8266-dht22-sensor for the inspiration for reading the DHT22 sensor values
+  2) https://github.com/256dpi/arduino-mqtt/blob/master/examples/AdafruitHuzzahESP8266/AdafruitHuzzahESP8266.ino
+*/
 
 #include <ESP8266WiFi.h>
-#include <WiFiClient.h>
+#include <MQTTClient.h>
 #include <RunningAverage.h>
+
+#include <DHT.h>
 
 #define SENSOR_DHT22 1
 #define DHTTYPE DHT22
 
+#define DHTPIN  2
+DHT dht(DHTPIN, DHTTYPE, 11); // 11 works fine for ESP8266
+
 const char* ssid = "********";
 const char* password = "********";
 
+const char* mqttServer = "1.2.3.4";
+const char* tempTopic = "dht22/temperature";
+const char* humiTopic = "dht22/humidity";
+
 // The sensor ID. Used by the server (e.g. OpenHab implementation) to identify where the data is coming from.
-const char* sensorid = "********";
+const char* sensorid = "dht22";
 
 // Initialize the Ethernet client library
-// with the IP address and port of the server 
+// with the IP address and port of the server
 // that you want to connect to (port 80 is default for HTTP):
-WiFiClient client;
-IPAddress server(1,2,3,4); // Server to send data (e.g. OpenHab)
-
-#include <DHT.h>
-#define DHTPIN  2
-DHT dht(DHTPIN, DHTTYPE, 11); // 11 works fine for ESP8266
+WiFiClient net;
+MQTTClient client;
 
 RunningAverage* temp_aggregator;
 RunningAverage* hum_aggregator;
@@ -42,126 +46,13 @@ const long sensorReadIntervalMillis = 10000;
 unsigned long previousSensorReadMillis;
 
 unsigned long lastConnectionTime = 0;              // last time you connected to the server, in milliseconds
-const unsigned long postingInterval = 10L * 1000L; // delay between updates, in milliseconds
+const unsigned long postingInterval = 15L * 1000L; // delay between updates, in milliseconds
 
-String restUrl = "";
-
-// this method makes a HTTP connection to the server:
-void httpRequest() {
-  // close any connection before send a new request.
-  // This will free the socket on the WiFi shield
-  client.stop();
-
-  // if there's a successful connection:
-  if (client.connect(server, 80)) {
-    Serial.println("sending data...");
-    // send the HTTP request:
-    restUrl = "/sensor/" + String(sensorid) + "/temperature/" + String(temp_aggregator->getAverage()) + "/humidity" + String(hum_aggregator->getAverage());
-    client.println("GET " + restUrl + +" HTTP/1.1");
-    client.println("Host: " + String(sensorid));
-    client.println("User-Agent: ESP01/1.0");
-    client.println("Connection: close");
-    client.println();
-
-    // note the time that the connection was made:
-    lastConnectionTime = millis();
-  } else {
-    // if you couldn't make a connection:
-    Serial.println("connection failed");
-  }
-}
-
-void printWifiStatus() {
-  // print the SSID of the network you're attached to:
-  Serial.print("SSID: ");
-  Serial.println(WiFi.SSID());
-
-  // print your WiFi shield's IP address:
-  IPAddress ip = WiFi.localIP();
-  Serial.print("IP Address: ");
-  Serial.println(ip);
-
-  // print the received signal strength:
-  long rssi = WiFi.RSSI();
-  Serial.print("signal strength (RSSI):");
-  Serial.print(rssi);
-  Serial.println(" dBm");
-}
-
-void printMacAddress() {
-  // the MAC address of your Wifi shield
-  byte mac[6];
-
-  // print your MAC address:
-  WiFi.macAddress(mac);
-  Serial.print("MAC: ");
-  Serial.print(mac[5], HEX);
-  Serial.print(":");
-  Serial.print(mac[4], HEX);
-  Serial.print(":");
-  Serial.print(mac[3], HEX);
-  Serial.print(":");
-  Serial.print(mac[2], HEX);
-  Serial.print(":");
-  Serial.print(mac[1], HEX);
-  Serial.print(":");
-  Serial.println(mac[0], HEX);
-}
-
-void printEncryptionType(int thisType) {
-  // read the encryption type and print out the name:
-  switch (thisType) {
-    case ENC_TYPE_WEP:
-      Serial.println("WEP");
-      break;
-    case ENC_TYPE_TKIP:
-      Serial.println("WPA");
-      break;
-    case ENC_TYPE_CCMP:
-      Serial.println("WPA2");
-      break;
-    case ENC_TYPE_NONE:
-      Serial.println("None");
-      break;
-    case ENC_TYPE_AUTO:
-      Serial.println("Auto");
-      break;
-  }
-}
-
-void listNetworks() {
-  // scan for nearby networks:
-  Serial.println("** Scan Networks **");
-  int numSsid = WiFi.scanNetworks();
-  if (numSsid == -1) {
-    Serial.println("Couldn't get a wifi connection");
-    while (true);
-  }
-
-  // print the list of networks seen:
-  Serial.print("number of available networks:");
-  Serial.println(numSsid);
-
-  // print the network number and name for each network found:
-  for (int thisNet = 0; thisNet < numSsid; thisNet++) {
-    Serial.print(thisNet);
-    Serial.print(") ");
-    Serial.print(WiFi.SSID(thisNet));
-    Serial.print("\tSignal: ");
-    Serial.print(WiFi.RSSI(thisNet));
-    Serial.print(" dBm");
-    Serial.print("\tEncryption: ");
-    printEncryptionType(WiFi.encryptionType(thisNet));
-  }
-}
+unsigned long resetPeriod = 86400000; // 1 day
 
 /* Connect to the WiFi network and print a lot of debug information */
 void connectWiFi() {
-  Serial.println("Scanning available networks...");
-  listNetworks();
-  delay(10000);
-
-  Serial.println("Connecting to " + String(ssid));
+  Serial.print("Connecting to " + String(ssid));
   WiFi.begin(ssid, password);
 
   // Wait for connection
@@ -170,11 +61,25 @@ void connectWiFi() {
     Serial.print(".");
   }
 
+  Serial.println(" done");
+}
+
+void connectMQTT() {
   Serial.println("");
-  Serial.print("Connected to ");
-  Serial.println(ssid);
-  printMacAddress();
-  printWifiStatus();
+  String mqttClientId = "humidori-" + String(millis());
+  Serial.print("Connecting " + mqttClientId + " to MQTT broker");
+
+  client.begin(mqttServer, net);
+
+  while (!client.connect((char*) mqttClientId.c_str())) {
+    Serial.print(".");
+  }
+  Serial.println(" done");
+}
+
+void connect() {
+  connectWiFi();
+  connectMQTT();
 }
 
 // read the sensor with the given bus index. Sets temperature in temp,
@@ -186,7 +91,7 @@ int read_sensor(float& temp, float& humidity) {
   // Works better than delay for things happening elsewhere also
   unsigned long currentMillis = millis();
 
-  if(currentMillis - previousSensorReadMillis >= sensorReadIntervalMillis) {
+  if (currentMillis - previousSensorReadMillis >= sensorReadIntervalMillis) {
     // save the last time you read the sensor
     previousSensorReadMillis = currentMillis;
 
@@ -199,11 +104,11 @@ int read_sensor(float& temp, float& humidity) {
     //Serial.print("Free heap:");
     //Serial.println(ESP.getFreeHeap(),DEC);
 
-    if (isnan(temp) || temp==85.0 || temp==(-127.0)) {
+    if (isnan(temp) || temp == 85.0 || temp == (-127.0)) {
       Serial.println("Failed to read from sensor");
       // resetting the previous measurement time so that a failed attempt
       // will be repeated with the next query.
-      previousSensorReadMillis=currentMillis-2000;
+      previousSensorReadMillis = currentMillis - 2000;
       if (previousSensorReadMillis < 0) previousSensorReadMillis = 0;
       return MEASURED_FAILED;
     } else {
@@ -228,45 +133,64 @@ void setup() {
   hum_aggregator = new RunningAverage(6);
   sensor_ok = false;
 
-  connectWiFi();
+  connect();
+
+  Serial.println("Setup done");
+}
+
+void updateAggregators(float& temp, float& humidity) {
+ switch (read_sensor(temp, humidity)) {
+    case MEASURED_OK:
+      sensor_ok = true;
+      //Serial.print("Updating accumulator w/ new measurements: ");
+      //Serial.print(" temperature: ");
+      //Serial.print(temp);
+      //Serial.print(", humidity: ");
+      //Serial.println(humidity);
+      temp_aggregator->addValue(temp);
+      hum_aggregator->addValue(humidity);
+      break;
+    case MEASURED_FAILED:
+      Serial.println("Measurement failed");
+      sensor_ok = false;
+      break;
+    case TOO_EARLY:
+      ;;
+      break;
+  } 
 }
 
 void loop() {
 
-      float temp = 0.0;
-      float humidity = 0.0;
-      switch (read_sensor(temp, humidity)) {
-        case MEASURED_OK:
-          sensor_ok = true;
-          Serial.print("Updating accumulator w/ new measurements: ");
-          Serial.print(" temperature: ");
-          Serial.print(temp);
-          Serial.print(", humidity: ");
-          Serial.println(humidity);
-          temp_aggregator->addValue(temp);
-          hum_aggregator->addValue(humidity);
-          break;
-        case MEASURED_FAILED:
-          Serial.println("Measurement failed");
-          sensor_ok = false;
-          break;
-        case TOO_EARLY:
-          ;;
-          break;
-      }
+  client.loop();
+  delay(10);
 
-    // if there's incoming data from the net connection.
-      // send it out the serial port.  This is for debugging
-      // purposes only:
-      while (client.available()) {
-        char c = client.read();
-        Serial.write(c);
-      }
+  if (!client.connected()) {
+    connect();
+  }
+  
+  float temp = 0.0;
+  float humidity = 0.0;
+  updateAggregators(temp, humidity);
 
-      // if ten seconds have passed since your last connection,
-      // then connect again and send data:
-      if (millis() - lastConnectionTime > postingInterval) {
-        httpRequest();
-      }
+  // if ten seconds have passed since your last connection,
+  // then connect again and send data:
+  if (millis() - lastConnectionTime > postingInterval) {
+    lastConnectionTime = millis();
+    Serial.println("Publishing data");
+    client.publish(tempTopic, String(temp_aggregator->getAverage()));
+    client.publish(humiTopic, String(hum_aggregator->getAverage()));
+  }
+  // reset after resetPeriod to avoid memory leaks
+  //if (millis() > resetPeriod) {
+  //  ESP.restart();
+  //}
 }
 
+void messageReceived(String topic, String payload, char * bytes, unsigned int length) {
+  Serial.print("incoming: ");
+  Serial.print(topic);
+  Serial.print(" - ");
+  Serial.print(payload);
+  Serial.println();
+}
